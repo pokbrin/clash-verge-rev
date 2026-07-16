@@ -1,11 +1,11 @@
 name: Build macOS (aarch64)
 
 on:
-  workflow_dispatch:        # 只手动触发，不要 tag/main 门禁
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-latest   # = Apple Silicon (arm64)，和 M3 同架构
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v7
 
@@ -16,9 +16,9 @@ jobs:
 
       - uses: pnpm/action-setup@v6
         with:
-          run_install: false   # 自动读 package.json 里的 pnpm@11.3.0
+          run_install: false
 
-      - name: Install Rust (1.95.0, 由 rust-toolchain.toml 锁定)
+      - name: Install Rust (1.95.0)
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: '1.95.0'
@@ -28,7 +28,7 @@ jobs:
         with:
           workspaces: '. -> target'
 
-      - name: Install deps + prebuild (aarch64 内核/资源)
+      - name: Install deps + prebuild
         run: |
           pnpm i
           pnpm run prebuild aarch64-apple-darwin
@@ -38,10 +38,20 @@ jobs:
         env:
           NODE_OPTIONS: '--max-old-space-size=4096'
 
+      - name: Collect & list build artifacts
+        run: |
+          mkdir -p artifacts
+          echo "=== 查找产物（同时搜 target 与 src-tauri/target）==="
+          find target src-tauri/target \( -name '*.dmg' -o -name '*.app' \) -print 2>/dev/null || true
+          # 拷贝 .dmg（文件）
+          find target src-tauri/target -type f -name '*.dmg' -exec cp {} artifacts/ \; 2>/dev/null || true
+          # 拷贝 .app（目录 bundle）
+          find target src-tauri/target -name '*.app' -exec cp -R {} artifacts/ \; 2>/dev/null || true
+          echo "=== artifacts/ 内容 ==="
+          ls -la artifacts/
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: clash-verge-macos-aarch64
-          path: |
-            src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/release/bundle/macos/*.app
+          path: artifacts/

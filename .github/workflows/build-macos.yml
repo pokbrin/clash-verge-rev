@@ -1,13 +1,29 @@
 name: Build macOS (aarch64)
 
+# on:
+#   workflow_dispatch:
+
+##############
 on:
   workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Commit SHA to build'
+        required: true
+        type: string
+##############
+
 
 jobs:
   build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@v7
+        ##############
+        with:
+          ref: ${{ inputs.commit_sha }}
+        ##############
 
       - name: Install Node
         uses: actions/setup-node@v6

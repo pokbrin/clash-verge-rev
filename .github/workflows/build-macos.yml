@@ -50,7 +50,9 @@ jobs:
           pnpm run prebuild aarch64-apple-darwin
 
       - name: Build (release)
-        run: pnpm build
+        # release tags enable updater signing, whose private key is not
+        # available on this repo; skip updater artifacts so the build exits 0
+        run: pnpm exec tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
         env:
           NODE_OPTIONS: '--max-old-space-size=4096'
 

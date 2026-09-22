@@ -1,14 +1,10 @@
 import {
-  closestCenter,
-  DndContext,
-  type DragEndEvent,
-  DragOverlay,
+  DragDropProvider,
   KeyboardSensor,
   PointerSensor,
-  useSensor,
-  useSensors,
-} from '@dnd-kit/core'
-import { SortableContext, sortableKeyboardCoordinates } from '@dnd-kit/sortable'
+  type DragEndEvent,
+} from '@dnd-kit/react'
+import { isSortable } from '@dnd-kit/react/sortable'
 import {
   CheckBoxOutlineBlankRounded,
   CheckBoxRounded,
@@ -44,34 +40,33 @@ import {
 } from '@/components/profile/profile-viewer'
 import { ConfigViewer } from '@/components/setting/mods/config-viewer'
 import { useListen } from '@/hooks/use-listen'
-import { useProfiles } from '@/hooks/use-profiles'
+import { fetchProfilesIntoCache, useProfiles } from '@/hooks/use-profiles'
 import {
   createProfile,
   deleteProfile,
   enhanceProfiles,
-  getProfiles,
-  //restartCore,
   getRuntimeLogs,
   importProfile,
   reorderProfile,
   updateProfile,
 } from '@/services/cmds'
-import { showNotice } from '@/services/notice-service'
-import {
-  fetchCacheData,
-  revalidateQueries,
-  useQuery,
-} from '@/services/query-client'
+import { subscribeVergeEvents } from '@/services/events'
+import { errorDetail, showNotice } from '@/services/notice-service'
+import { revalidateQuery, useQuery } from '@/services/query-client'
 import {
   useLoadingCache,
   useSetLoadingCache,
   useThemeMode,
 } from '@/services/states'
 import { debugLog } from '@/utils/debug'
+import { isValidUrl } from '@/utils/network'
 
 // 与 src-tauri/src/main.rs 的 worker_limit 上限(8)保持一致，避免前后端更新风暴不对齐
 const PROFILE_UPDATE_WORKER_LIMIT = 8
 const PROFILE_SWITCH_LOADING_DELAY = 400
+const profilePointerSensor = PointerSensor.configure({
+  activationConstraints: () => undefined,
+})
 
 interface ProfileSwitchRequest {
   profile: string
@@ -79,7 +74,6 @@ interface ProfileSwitchRequest {
   force: boolean
 }
 
-// 记录profile切换状态
 const debugProfileSwitch = (action: string, profile: string, extra?: any) => {
   const timestamp = new Date().toISOString().substring(11, 23)
   debugLog(`[Profile-Debug][${timestamp}] ${action}: ${profile}`, extra || '')
@@ -91,14 +85,20 @@ const ProfilePage = () => {
   const { addListener } = useListen()
   const [url, setUrl] = useState('')
   const [disabled, setDisabled] = useState(false)
+  const [profileDndRevision, setProfileDndRevision] = useState(0)
   const [activatings, setActivatings] = useState<string[]>([])
   const [switchTarget, setSwitchTarget] = useState<string | null>(null)
   const [visibleSwitchingProfile, setVisibleSwitchingProfile] = useState<
     string | null
   >(null)
   const [loading, setLoading] = useState(false)
+  const [timerUpdateRevisions, setTimerUpdateRevisions] = useState<
+    Map<string, number>
+  >(() => new Map())
+  const [completedUpdateRevisions, setCompletedUpdateRevisions] = useState<
+    Map<string, number>
+  >(() => new Map())
 
-  // Batch selection states
   const [batchMode, setBatchMode] = useState(false)
   const [selectedProfiles, setSelectedProfiles] = useState<Set<string>>(
     () => new Set(),
@@ -113,14 +113,6 @@ const ProfilePage = () => {
   )
   const currentProfileRef = useRef<string | undefined>(undefined)
   const profilePageMountedRef = useRef(true)
-  const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: { distance: 8 },
-    }),
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-    }),
-  )
   const { current } = location.state || {}
 
   const {
@@ -175,18 +167,12 @@ const ProfilePage = () => {
     }
   }, [addListener, mutateProfiles])
 
-  // 添加紧急恢复功能
   const onEmergencyRefresh = useLockFn(async () => {
     debugLog('[紧急刷新] 开始强制刷新所有数据')
 
     try {
-      // 只失效 profiles 相关 query，不影响 WS 订阅、IP 缓存等其他 query
-      await revalidateQueries([['getProfiles'], ['getRuntimeLogs']])
+      await Promise.all([revalidateQuery(['getRuntimeLogs']), mutateProfiles()])
 
-      // 强制重新获取配置数据
-      await mutateProfiles()
-
-      // 等待状态稳定后增强配置
       await new Promise((resolve) => setTimeout(resolve, 500))
       await onEnhance(false)
 
@@ -198,7 +184,7 @@ const ProfilePage = () => {
       console.error('[紧急刷新] 失败:', error)
       showNotice.error(
         'profiles.page.feedback.notices.emergencyRefreshFailed',
-        { message: String(error) },
+        { message: errorDetail(error) },
         4000,
       )
     }
@@ -215,13 +201,12 @@ const ProfilePage = () => {
   const viewerRef = useRef<ProfileViewerRef>(null)
   const configRef = useRef<DialogRef>(null)
 
-  // distinguish type
   const profileItems = useMemo(() => {
     const items = profiles.items || []
 
     const type1 = ['local', 'remote']
 
-    return items.filter((i) => i && type1.includes(i.type!))
+    return items.filter((i) => i?.type && type1.includes(i.type))
   }, [profiles])
 
   const currentActivatings = () => {
@@ -230,8 +215,7 @@ const ProfilePage = () => {
 
   const onImport = async () => {
     if (!url) return
-    // 校验url是否为http/https
-    if (!/^https?:\/\//i.test(url)) {
+    if (!isValidUrl(url)) {
       showNotice.error('profiles.page.feedback.errors.invalidUrl')
       return
     }
@@ -243,20 +227,19 @@ const ProfilePage = () => {
       await performRobustRefresh()
     }
     try {
-      // 尝试正常导入
       await importProfile(url)
       await handleImportSuccess('shared.feedback.notifications.importSuccess')
     } catch (initialErr) {
       console.warn('[订阅导入] 首次导入失败:', initialErr)
 
-      if (String(initialErr).toLowerCase().includes('legacy tls')) {
-        showNotice.error(String(initialErr))
+      const initialDetail = errorDetail(initialErr)
+      if (initialDetail.toLowerCase().includes('legacy tls')) {
+        showNotice.error(initialErr)
         return
       }
 
       showNotice.info('profiles.page.feedback.notifications.importRetry')
       try {
-        // 使用自身代理尝试导入
         await importProfile(url, {
           with_proxy: false,
           self_proxy: true,
@@ -265,10 +248,9 @@ const ProfilePage = () => {
           'shared.feedback.notifications.importWithClashProxy',
         )
       } catch (retryErr) {
-        // 回退导入也失败
         showNotice.error(
           'profiles.page.feedback.notifications.importFail',
-          String(retryErr),
+          retryErr,
         )
       }
     } finally {
@@ -277,8 +259,7 @@ const ProfilePage = () => {
     }
   }
 
-  // 强化的刷新策略
-  // maxRetries 设为 1：useProfiles 内部 useQuery 已配置 retry:3，业务层只需 1 次额外重试
+  // `useProfiles` already retries three times; add only one business-level retry.
   const performRobustRefresh = async () => {
     let retryCount = 0
     const maxRetries = 1
@@ -288,10 +269,8 @@ const ProfilePage = () => {
       try {
         debugLog(`[导入刷新] 第${retryCount + 1}次尝试刷新配置数据`)
 
-        // 强制刷新，绕过所有缓存
         await mutateProfiles()
 
-        // 等待状态稳定
         await new Promise((resolve) =>
           setTimeout(resolve, baseDelay * (retryCount + 1)),
         )
@@ -307,11 +286,9 @@ const ProfilePage = () => {
       }
     }
 
-    // 所有重试失败后的最后尝试
     console.warn(`[导入刷新] 常规刷新失败，尝试清除缓存重新获取`)
     try {
-      // 清除缓存并重新获取
-      await fetchCacheData(['getProfiles'], getProfiles)
+      await fetchProfilesIntoCache()
       await onEnhance(false)
       showNotice.error(
         'profiles.page.feedback.notifications.importNeedsRefresh',
@@ -327,12 +304,31 @@ const ProfilePage = () => {
   }
 
   const onDragEnd = async (event: DragEndEvent) => {
-    const { active, over } = event
-    if (over) {
-      if (active.id !== over.id) {
-        await reorderProfile(active.id.toString(), over.id.toString())
-        mutateProfiles()
-      }
+    const { operation, canceled } = event
+    const { source, target } = operation
+    if (canceled || !target || !isSortable(source)) return
+
+    const { index: newIndex, initialIndex: oldIndex } = source.sortable
+    if (
+      oldIndex < 0 ||
+      newIndex < 0 ||
+      oldIndex >= profileItems.length ||
+      newIndex >= profileItems.length ||
+      oldIndex === newIndex
+    ) {
+      return
+    }
+
+    const activeId = profileItems[oldIndex]?.uid
+    const overId = profileItems[newIndex]?.uid
+    if (activeId == null || overId == null || activeId === overId) return
+
+    try {
+      await reorderProfile(activeId, overId)
+      mutateProfiles()
+    } catch (error) {
+      setProfileDndRevision((revision) => revision + 1)
+      showNotice.error(error)
     }
   }
 
@@ -517,7 +513,6 @@ const ProfilePage = () => {
     }
   })
 
-  // 更新所有订阅
   const loadingCache = useLoadingCache()
   const setLoadingCache = useSetLoadingCache()
   const setLoadingProfiles = useCallback(
@@ -536,6 +531,34 @@ const ProfilePage = () => {
     },
     [setLoadingCache],
   )
+
+  useEffect(
+    () =>
+      subscribeVergeEvents({
+        'profile-update-started': ({ uid }) => {
+          if (uid) setLoadingProfiles([uid], true)
+        },
+        'profile-update-completed': ({ uid }) => {
+          if (!uid) return
+          setLoadingProfiles([uid], false)
+          setCompletedUpdateRevisions((current) => {
+            const next = new Map(current)
+            next.set(uid, (next.get(uid) ?? 0) + 1)
+            return next
+          })
+          void mutateProfiles()
+        },
+        'verge://timer-updated': (uid) => {
+          setTimerUpdateRevisions((current) => {
+            const next = new Map(current)
+            next.set(uid, (next.get(uid) ?? 0) + 1)
+            return next
+          })
+        },
+      }),
+    [mutateProfiles, setLoadingProfiles],
+  )
+
   const runProfileUpdates = useCallback(
     async (uids: string[]) => {
       if (uids.length === 0) return
@@ -566,7 +589,6 @@ const ProfilePage = () => {
         await Promise.allSettled(Array.from({ length: active }, worker))
       } finally {
         setLoadingProfiles(uids, false)
-        // 避免长时间批量更新后列表数据过晚刷新
         void mutateProfiles()
       }
     },
@@ -587,11 +609,9 @@ const ProfilePage = () => {
     if (text) setUrl(text)
   }
 
-  // Batch selection functions
   const toggleBatchMode = () => {
     setBatchMode(!batchMode)
     if (!batchMode) {
-      // Entering batch mode - clear previous selections
       setSelectedProfiles(new Set())
     }
   }
@@ -624,11 +644,11 @@ const ProfilePage = () => {
 
   const getSelectionState = () => {
     if (selectedProfiles.size === 0) {
-      return 'none' // 无选择
+      return 'none'
     } else if (selectedProfiles.size === profileItems.length) {
-      return 'all' // 全选
+      return 'all'
     } else {
-      return 'partial' // 部分选择
+      return 'partial'
     }
   }
 
@@ -636,7 +656,6 @@ const ProfilePage = () => {
     if (selectedProfiles.size === 0) return
 
     try {
-      // Get all currently activating profiles
       const currentActivating =
         profiles.current && selectedProfiles.has(profiles.current)
           ? [profiles.current]
@@ -644,7 +663,6 @@ const ProfilePage = () => {
 
       setActivatings((prev) => [...new Set([...prev, ...currentActivating])])
 
-      // Delete all selected profiles
       for (const uid of selectedProfiles) {
         await deleteProfile(uid)
       }
@@ -652,12 +670,10 @@ const ProfilePage = () => {
       await mutateProfiles()
       await mutateLogs()
 
-      // If any deleted profile was current, enhance profiles
       if (currentActivating.length > 0) {
         await onEnhance(false)
       }
 
-      // Clear selections and exit batch mode
       setSelectedProfiles(new Set())
       setBatchMode(false)
 
@@ -740,7 +756,9 @@ const ProfilePage = () => {
                 <IconButton
                   size="small"
                   color="warning"
-                  title="数据异常，点击强制刷新"
+                  title={t(
+                    'profiles.page.feedback.tooltips.forceRefreshStaleData',
+                  )}
                   onClick={onEmergencyRefresh}
                   sx={{
                     animation: 'pulse 2s infinite',
@@ -756,7 +774,6 @@ const ProfilePage = () => {
               )}
             </>
           ) : (
-            // Batch mode header
             <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
               <IconButton
                 size="small"
@@ -873,101 +890,102 @@ const ProfilePage = () => {
         </Button>
       </Stack>
 
-      <DndContext
-        sensors={sensors}
-        collisionDetection={closestCenter}
-        onDragEnd={onDragEnd}
+      <Box
+        sx={{
+          pl: '10px',
+          pr: '10px',
+          height: 'calc(100% - 48px)',
+          overflowY: 'auto',
+        }}
       >
-        <Box
-          sx={{
-            pl: '10px',
-            pr: '10px',
-            height: 'calc(100% - 48px)',
-            overflowY: 'auto',
-          }}
+        <DragDropProvider
+          key={profileDndRevision}
+          sensors={[profilePointerSensor, KeyboardSensor]}
+          onDragEnd={onDragEnd}
         >
-          <Box sx={{ mb: 1.5 }}>
-            <Grid container spacing={{ xs: 1, lg: 1 }}>
-              <SortableContext
-                items={profileItems.map((x) => {
-                  return x.uid
-                })}
-              >
-                {profileItems.map((item) => (
-                  <Grid size={{ xs: 12, sm: 6, md: 4, lg: 3 }} key={item.file}>
-                    <ProfileItem
-                      id={item.uid}
-                      selected={(switchTarget ?? profiles.current) === item.uid}
-                      activating={
-                        activatings.includes(item.uid) ||
-                        visibleSwitchingProfile === item.uid
-                      }
-                      itemData={item}
-                      mutateProfiles={mutateProfiles}
-                      onSelect={(f) => onSelect(item.uid, f)}
-                      onEdit={() => viewerRef.current?.edit(item)}
-                      onSave={async (prev, curr) => {
-                        if (prev !== curr && profiles.current === item.uid) {
-                          await onEnhance(false)
-                          //  await restartCore();
-                          //   Notice.success(t("settings.feedback.notifications.clash.restartSuccess"), 1000);
-                        }
-                      }}
-                      onDelete={() => {
-                        if (batchMode) {
-                          toggleProfileSelection(item.uid)
-                        } else {
-                          onDelete(item.uid)
-                        }
-                      }}
-                      batchMode={batchMode}
-                      isSelected={selectedProfiles.has(item.uid)}
-                      onSelectionChange={() => toggleProfileSelection(item.uid)}
-                    />
-                  </Grid>
-                ))}
-              </SortableContext>
-            </Grid>
+          <Box
+            sx={{
+              mb: 1.5,
+              display: 'grid',
+              overflow: 'hidden',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))',
+              gap: 1,
+              px: 0.5,
+            }}
+          >
+            {profileItems.map((item, index) => (
+              <ProfileItem
+                key={item.uid}
+                id={item.uid}
+                index={index}
+                selected={(switchTarget ?? profiles.current) === item.uid}
+                activating={
+                  activatings.includes(item.uid) ||
+                  visibleSwitchingProfile === item.uid
+                }
+                itemData={item}
+                timerUpdateRevision={timerUpdateRevisions.get(item.uid) ?? 0}
+                completedUpdateRevision={
+                  completedUpdateRevisions.get(item.uid) ?? 0
+                }
+                mutateProfiles={mutateProfiles}
+                onSelect={(f) => onSelect(item.uid, f)}
+                onEdit={() => viewerRef.current?.edit(item)}
+                onSave={async (prev, curr) => {
+                  if (prev !== curr && profiles.current === item.uid) {
+                    await onEnhance(false)
+                  }
+                }}
+                onDelete={() => {
+                  if (batchMode) {
+                    toggleProfileSelection(item.uid)
+                  } else {
+                    onDelete(item.uid)
+                  }
+                }}
+                batchMode={batchMode}
+                isSelected={selectedProfiles.has(item.uid)}
+                onSelectionChange={() => toggleProfileSelection(item.uid)}
+              />
+            ))}
           </Box>
-          <Divider
-            variant="middle"
-            flexItem
-            sx={{ width: `calc(100% - 32px)`, borderColor: dividercolor }}
-          ></Divider>
-          <Box sx={{ mt: 1.5, mb: '10px' }}>
-            <Grid container spacing={{ xs: 1, lg: 1 }}>
-              <Grid size={{ xs: 12, sm: 6, md: 6, lg: 6 }}>
-                <ProfileMore
-                  id="Merge"
-                  onSave={async (prev, curr) => {
-                    if (prev !== curr) {
-                      await onEnhance(false)
-                    }
-                  }}
-                />
-              </Grid>
-              <Grid size={{ xs: 12, sm: 6, md: 6, lg: 6 }}>
-                <ProfileMore
-                  id="Script"
-                  logInfo={chainLogs['Script']}
-                  onSave={async (prev, curr) => {
-                    if (prev !== curr) {
-                      await onEnhance(false)
-                    }
-                  }}
-                />
-              </Grid>
+        </DragDropProvider>
+        <Divider
+          variant="middle"
+          flexItem
+          sx={{ width: `calc(100% - 32px)`, borderColor: dividercolor }}
+        ></Divider>
+        <Box sx={{ mt: 1.5, mb: '10px' }}>
+          <Grid container spacing={{ xs: 1, lg: 1 }}>
+            <Grid size={{ xs: 12, sm: 6, md: 6, lg: 6 }}>
+              <ProfileMore
+                id="Merge"
+                onSave={async (prev, curr) => {
+                  if (prev !== curr) {
+                    await onEnhance(false)
+                  }
+                }}
+              />
             </Grid>
-          </Box>
+            <Grid size={{ xs: 12, sm: 6, md: 6, lg: 6 }}>
+              <ProfileMore
+                id="Script"
+                logInfo={chainLogs['Script']}
+                onSave={async (prev, curr) => {
+                  if (prev !== curr) {
+                    await onEnhance(false)
+                  }
+                }}
+              />
+            </Grid>
+          </Grid>
         </Box>
-        <DragOverlay />
-      </DndContext>
+      </Box>
 
       <ProfileViewer
         ref={viewerRef}
         onChange={async (isActivating) => {
           mutateProfiles()
-          // 只有更改当前激活的配置时才触发全局重新加载
           if (isActivating) {
             await onEnhance(false)
           }

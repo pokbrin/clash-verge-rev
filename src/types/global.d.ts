@@ -11,9 +11,6 @@ type Platform =
   | 'cygwin'
   | 'netbsd'
 
-/**
- * defines in `vite.config.ts`
- */
 declare const OS_PLATFORM: Platform
 
 type ValidationOutcome =
@@ -21,9 +18,6 @@ type ValidationOutcome =
   | { status: 'invalid'; kind: string; message: string }
   | { status: 'skipped'; reason: string }
 
-/**
- * Some interface for clash api
- */
 interface IConfigData {
   port: number
   mode: string
@@ -213,12 +207,7 @@ interface IConnectionSetting {
   layout: 'table' | 'list'
 }
 
-/**
- * Some interface for command
- */
-
 interface IClashInfo {
-  // status: string;
   mixed_port?: number // clash mixed port
   socks_port?: number // clash socks port
   redir_port?: number // clash redir port
@@ -353,6 +342,12 @@ interface GrpcOptions {
   'grpc-service-name'?: string
 }
 
+interface XHttpOptions {
+  path?: string
+  host?: string
+  mode?: string
+}
+
 interface RealityOptions {
   'public-key'?: string
   'short-id'?: string
@@ -367,7 +362,7 @@ type ClientFingerprint =
   | '360'
   | 'qq'
   | 'random'
-type NetworkType = 'ws' | 'http' | 'h2' | 'grpc' | 'tcp'
+type NetworkType = 'ws' | 'http' | 'h2' | 'grpc' | 'tcp' | 'xhttp'
 type CipherType =
   | 'none'
   | 'auto'
@@ -599,6 +594,7 @@ interface IProxyVlessConfig extends IProxyBaseConfig {
   'h2-opts'?: H2Options
   'grpc-opts'?: GrpcOptions
   'ws-opts'?: WsOptions
+  'xhttp-opts'?: XHttpOptions
   'ws-path'?: string
   'ws-headers'?: {
     [key: string]: string
@@ -608,6 +604,7 @@ interface IProxyVlessConfig extends IProxyBaseConfig {
   servername?: string
   'client-fingerprint'?: ClientFingerprint
   smux?: boolean
+  encryption?: string
 }
 // vmess
 interface IProxyVmessConfig extends IProxyBaseConfig {
@@ -875,6 +872,7 @@ interface IVergeConfig {
   pause_render_traffic_stats_on_blur?: boolean
   menu_icon?: 'monochrome' | 'colorful' | 'disable'
   menu_order?: string[]
+  proxy_group_tools_position?: 'left' | 'right'
   notice_position?: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
   collapse_navbar?: boolean
   tray_icon?: 'monochrome' | 'colorful'
@@ -882,7 +880,6 @@ interface IVergeConfig {
   sysproxy_tray_icon?: boolean
   tun_tray_icon?: boolean
   enable_tray_speed?: boolean
-  // enable_tray_icon?: boolean;
   tray_proxy_groups_display_mode?: 'default' | 'inline' | 'disable'
   tray_inline_outbound_modes?: boolean
   enable_tun_mode?: boolean
@@ -893,6 +890,7 @@ interface IVergeConfig {
   enable_system_proxy?: boolean
   enable_global_hotkey?: boolean
   enable_dns_settings?: boolean
+  profile_dns_settings?: Record<string, { enabled: boolean }>
   proxy_auto_config?: boolean
   pac_file_content?: string
   proxy_host?: string
@@ -972,12 +970,10 @@ interface IWebDavConfig {
   password: string
 }
 
-// Traffic monitor types
 interface ITrafficDataPoint {
   up: number
   down: number
   timestamp: number
-  name: string
 }
 
 interface ISamplingConfig {
@@ -1010,10 +1006,6 @@ interface ITrafficWorkerAppendMessage {
   }
 }
 
-interface ITrafficWorkerClearMessage {
-  type: 'clear'
-}
-
 interface ITrafficWorkerSetRangeMessage {
   type: 'setRange'
   minutes: number
@@ -1026,24 +1018,14 @@ interface ITrafficWorkerRequestSnapshotMessage {
 type TrafficWorkerRequestMessage =
   | ITrafficWorkerInitMessage
   | ITrafficWorkerAppendMessage
-  | ITrafficWorkerClearMessage
   | ITrafficWorkerSetRangeMessage
   | ITrafficWorkerRequestSnapshotMessage
 
 interface ITrafficWorkerSnapshotMessage {
   type: 'snapshot'
   dataPoints: ITrafficDataPoint[]
-  availableDataPoints: ITrafficDataPoint[]
   samplerStats: ISamplerStats
-  rangeMinutes: number
   lastTimestamp?: number
-  reason:
-    | 'init'
-    | 'interval'
-    | 'range-change'
-    | 'request'
-    | 'append-throttle'
-    | 'clear'
 }
 
 interface ITrafficWorkerLogMessage {
